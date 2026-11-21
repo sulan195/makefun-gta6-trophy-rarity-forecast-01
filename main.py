@@ -6,27 +6,35 @@ every trophy's Exophase earn rate at the case's target, as
 {"trophies": [{"id": n, "q": [q05, q25, q50, q75, q95]}, ...]}.
 
 Method (standard library only, deterministic, no network, no clock reads):
-  1. Work in logit space, logit(p) = ln(p / (100 - p)), p in percent.
-  2. Per trophy, fit a weighted least-squares line of logit(rate) against
+  1. Split each trophy's rate into its two moving parts: earners and the
+     tracked-player count, rate = 100 * earners / players. Earners are
+     what grows as players progress; the player count is what dilutes
+     the rate (launch night's first refresh divided every rate by ~6
+     while the denominator jumped 638 -> 3,868 players). Forecasting the
+     two separately is the structural model; a single line on the rate
+     conflates them.
+  2. Work in log space: log earners and log players are each fitted with
+     a recency-weighted least-squares line against
      x = ln(1 + hours since the game's release, 2026-11-19T00:00:00Z),
-     over the case's recent reads, with recency weights. This is the same
-     family as the house curve baseline, but with three corrections:
-       a. the slope is shrunk toward its tier's mean slope (precision
-          weighted), because a single trophy's short history is noisy;
-       b. the extrapolated move is damped, kappa = 1 / (1 + horizon_days/6),
-          because trophy growth decelerates as the reachable cohort is
-          exhausted and the tracked-player base matures; the house curve
-          extrapolates its line undamped, which overshoots when growth
-          saturates;
-       c. the spread is honest: a random-walk term (0.5 logit per sqrt day),
-          the slope's own standard error projected to the target, and a
-          refresh-shock term for Exophase's discrete page refreshes, which
-          dominates short horizons (the practice cases straddle one refresh)
-          and fades over long ones.
-  3. Degenerate histories (a single read, every read identical, rates
-     missing) fall back to a flat forecast at the last rate with the same
-     spread machinery; a trophy with no rate in any read falls back to a
-     tier prior. A case with no usable history at all still yields a valid
+     over the case's recent reads. The player trend is one series shared
+     by every trophy, so it is estimated once and precisely; each
+     trophy's earner slope is shrunk toward its tier's mean earner slope
+     (platinum / gold / silver / bronze), because a single trophy's short
+     history is noisy.
+  3. The median rate at the target is 100 * earners(target) /
+     players(target), with each extrapolated move damped by
+     kappa = 1 / (1 + horizon_days / 6), because growth decelerates as
+     the reachable cohort is exhausted and the launch surge passes. The
+     median move is capped at 4 logit units from the last read.
+  4. The spread is honest: a random-walk term (0.5 logit per sqrt day),
+     the slopes' own standard errors projected to the target, and a
+     refresh-shock term for Exophase's discrete page refreshes, which
+     dominates short horizons (the practice cases straddle one refresh)
+     and fades over long ones.
+  5. Degenerate histories (a single read, every read identical, rates
+     missing, no player counts) fall back to a direct logit-rate line fit
+     (v1), and a trophy with no rate anywhere falls back to a tier
+     prior. A case with no usable history at all still yields a valid
      forecast, so a run never produces an invalid case.
 
 Quantiles use the standard normal's ppf (statistics.NormalDist, exact) at
@@ -165,6 +173,50 @@ def trophy_series(case, index):
     return times, values
 
 
+def players_series(case):
+    """(times, log players) for the case, skipping reads without a count."""
+    times = []
+    values = []
+    for read in case.get("history", []):
+        players = read.get("players_tracked")
+        if not players or float(players) <= 0:
+            continue
+        try:
+            moment = parse_time(read["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        times.append(moment)
+        values.append(math.log(float(players)))
+    return times, values
+
+
+def earners_series(case, index):
+    """(times, log earners) for one trophy: earners = rate * players / 100.
+
+    Earners are what actually grows as players progress; the tracked-player
+    count is what dilutes the rate. Splitting the two is the structural
+    model: a trophy's rate moves with its earners against the player base.
+    Reads that lack the trophy's rate, or a player count, are skipped.
+    """
+    times = []
+    values = []
+    for read in case.get("history", []):
+        rates = read.get("rates") or []
+        players = read.get("players_tracked")
+        if index >= len(rates) or rates[index] is None:
+            continue
+        if not players or float(players) <= 0:
+            continue
+        try:
+            moment = parse_time(read["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        earners = max(0.02, float(rates[index]) * float(players) / 100.0)
+        times.append(moment)
+        values.append(math.log(earners))
+    return times, values
+
+
 def forecast_trophy(trophy, times, values, x_target, horizon_days,
                     tier_slope, tier_slope_weight):
     """Forecast one trophy's five quantiles. Returns (median_logit, spread)."""
@@ -244,8 +296,163 @@ def tier_slopes(case, horizon_days):
     return out
 
 
-def forecast_case(case):
-    """Forecast every trophy of one case. Returns the output object."""
+def earner_slopes(case):
+    """Precision-weighted mean log-earner slope per tier, for shrinkage."""
+    per_tier = {}
+    global_slopes = []
+    for i, trophy in enumerate(case.get("trophies", [])):
+        times, values = earners_series(case, i)
+        if len(times) < 3:
+            continue
+        xs = [log_time(t) for t in times]
+        fit = wls_line(xs, values, [1.0] * len(xs))
+        if fit is None:
+            continue
+        _a, slope, se_b, _resid, _n = fit
+        se = max(se_b, 0.05)
+        tier = str(trophy.get("tier", "bronze")).lower()
+        per_tier.setdefault(tier, []).append((slope, 1.0 / (se * se)))
+        global_slopes.append((slope, 1.0 / (se * se)))
+    out = {}
+    for tier, items in per_tier.items():
+        wsum = sum(w for _, w in items)
+        mean = sum(s * w for s, w in items) / wsum if wsum > 0 else 0.0
+        out[tier] = (mean, min(1.0, wsum / (wsum + 4.0)))
+    if global_slopes:
+        wsum = sum(w for _, w in global_slopes)
+        gmean = sum(s * w for s, w in global_slopes) / wsum if wsum > 0 else 0.0
+        out.setdefault("__global__", (gmean, 0.5))
+    return out
+
+
+def fit_recent(times, values, x_target, horizon_days):
+    """WLS log-time line over the recent window; damped extrapolation.
+
+    Returns (median_at_target, slope_se_projected, last_value, x_last).
+    The recent window is the last 24h of reads (or all of them when fewer);
+    recency weights have a 12h half-life. The extrapolated move from the
+    last value is damped by kappa = 1 / (1 + horizon_days / 6).
+    """
+    last_time = times[-1]
+    last_value = values[-1]
+    window_start = last_time.timestamp() - 24.0 * 3600.0
+    recent = [(t, v) for t, v in zip(times, values)
+              if t.timestamp() >= window_start]
+    if len(recent) < 3:
+        recent = list(zip(times, values))
+    xs = [log_time(t) for t, _ in recent]
+    ys = [v for _, v in recent]
+    ws = [max(0.2, math.exp(-(last_time - t).total_seconds() / (12.0 * 3600.0)))
+          for t, _ in recent]
+    fit = wls_line(xs, ys, ws)
+    if fit is None:
+        return last_value, 0.0, last_value, log_time(last_time)
+    _a, slope, se_b, _resid, _n = fit
+    x_last = log_time(last_time)
+    kappa = 1.0 / (1.0 + horizon_days / DAMP_DAYS)
+    move = slope * (x_target - x_last) * kappa
+    move = max(-MAX_MEDIAN_MOVE, min(MAX_MEDIAN_MOVE, move))
+    se_proj = max(se_b, 0.0) * abs(x_target - x_last)
+    return last_value + move, se_proj, last_value, x_last
+
+
+def forecast_case_decomp(case):
+    """Forecast via the earners/players decomposition (v2).
+
+    rate(target) = 100 * earners(target) / players(target), with log
+    earners and log players each extrapolated on the log-time axis. The
+    player count is one series shared by every trophy, so its trend is
+    estimated once and precisely; each trophy's earners carry its own
+    trend, shrunk toward its tier's mean earner slope. When a trophy has
+    no usable earner history, or the case has no player counts, that
+    trophy falls back to the direct logit-rate fit.
+    """
+    levels = list(case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95])
+    zscores = [norm_ppf(level) for level in levels]
+    horizon_days = float(case.get("horizon_minutes", 0)) / 1440.0
+    try:
+        target = parse_time(case["target"])
+    except (KeyError, TypeError, ValueError):
+        target = parse_time(case["at"])
+        horizon_days = float(case.get("horizon_minutes", 0)) / 1440.0
+    x_target = log_time(target)
+    kappa = 1.0 / (1.0 + horizon_days / DAMP_DAYS)
+    shock = SHOCK_SHORT * math.exp(-horizon_days / SHOCK_DECAY_DAYS) + SHOCK_FLOOR
+    # Shared player trend.
+    p_times, p_values = players_series(case)
+    if len(p_times) >= 2:
+        logp_star, se_p, logp_last, _x = fit_recent(
+            p_times, p_values, x_target, horizon_days)
+    else:
+        logp_star, se_p, logp_last = None, 0.0, None
+    e_tiers = earner_slopes(case)
+    global_mean, global_weight = e_tiers.get("__global__", (0.0, 0.0))
+    tiers = tier_slopes(case, horizon_days)
+    d_global_mean, d_global_weight = tiers.get("__global__", (0.0, 0.0))
+    rows = []
+    for i, trophy in enumerate(case.get("trophies", [])):
+        times, values = earners_series(case, i)
+        tier = str(trophy.get("tier", "bronze")).lower()
+        median = None
+        spread = None
+        if len(times) >= 2 and logp_star is not None:
+            tier_mean, tier_weight = e_tiers.get(tier, (global_mean, global_weight))
+            # Shrink this trophy's earner slope toward its tier mean.
+            xs = [log_time(t) for t in times]
+            ys = values
+            last_time = times[-1]
+            window_start = last_time.timestamp() - 24.0 * 3600.0
+            recent = [(t, v) for t, v in zip(times, values)
+                      if t.timestamp() >= window_start]
+            if len(recent) < 3:
+                recent = list(zip(times, values))
+            rxs = [log_time(t) for t, _ in recent]
+            rys = [v for _, v in recent]
+            rws = [max(0.2, math.exp(-(last_time - t).total_seconds() / (12.0 * 3600.0)))
+                   for t, _ in recent]
+            fit = wls_line(rxs, rys, rws)
+            if fit is not None:
+                _a, slope, se_b, _resid, _n = fit
+                se = max(se_b, 0.05)
+                w_own = 1.0 / (se * se)
+                w_tier = tier_weight / (SLOPE_PRIOR_SD ** 2)
+                if w_tier > 0:
+                    slope = (slope * w_own + tier_mean * w_tier) / (w_own + w_tier)
+                x_last = log_time(last_time)
+                move = slope * (x_target - x_last) * kappa
+                move = max(-MAX_MEDIAN_MOVE, min(MAX_MEDIAN_MOVE, move))
+                loge_star = values[-1] + move
+                se_e = max(se_b, 0.0) * abs(x_target - x_last)
+                rate_star = 100.0 * math.exp(loge_star - logp_star)
+                median = logit(rate_star)
+                slope_term = se_e ** 2 + se_p ** 2
+                spread = math.sqrt(RW_SIGMA ** 2 * horizon_days
+                                   + slope_term + shock ** 2)
+                spread = max(SPREAD_MIN, min(SPREAD_MAX, spread))
+        if median is None:
+            # No usable decomposition for this trophy: direct logit fit.
+            t_times, t_values = trophy_series(case, i)
+            d_tier_mean, d_tier_weight = tiers.get(
+                tier, (d_global_mean, d_global_weight))
+            median, spread = forecast_trophy(
+                trophy, t_times, t_values, x_target, horizon_days,
+                d_tier_mean, d_tier_weight)
+        quantiles = []
+        previous = None
+        for z in zscores:
+            value = round4(sigmoid(median + z * spread))
+            value = min(99.99, max(0.01, value))
+            if previous is not None and value < previous:
+                value = previous
+            quantiles.append(value)
+            previous = value
+        rows.append({"id": trophy["id"], "q": quantiles})
+    rows.sort(key=lambda row: row["id"])
+    return {"trophies": rows}
+
+
+def forecast_case_direct(case):
+    """Forecast via the direct logit-rate line fit (v1)."""
     levels = list(case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95])
     zscores = [norm_ppf(level) for level in levels]
     horizon_days = float(case.get("horizon_minutes", 0)) / 1440.0
@@ -277,6 +484,19 @@ def forecast_case(case):
         rows.append({"id": trophy["id"], "q": quantiles})
     rows.sort(key=lambda row: row["id"])
     return {"trophies": rows}
+
+
+def forecast_case(case):
+    """Forecast every trophy of one case. Returns the output object.
+
+    Primary model is the earners/players decomposition; the direct
+    logit-rate fit is the fallback for any case the decomposition cannot
+    handle, so a run never produces an invalid case.
+    """
+    try:
+        return forecast_case_decomp(case)
+    except Exception:
+        return forecast_case_direct(case)
 
 
 def fallback_case(case):

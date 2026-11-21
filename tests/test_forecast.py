@@ -211,6 +211,36 @@ class TestEdgeCases(unittest.TestCase):
         for row in out["trophies"]:
             self.assertEqual(row["q"], sorted(row["q"]))
 
+    def test_decomposition_captures_dilution(self):
+        # Players double while earners stay flat: the rate halves, and the
+        # decomposition forecast must sit below the last rate, not at it.
+        history = []
+        for hour in (0, 4, 8, 12, 16):
+            at = "2026-11-19T%02d:00:00Z" % hour
+            players = 1000 * (2.0 ** (hour / 24.0))
+            history.append(read(at, int(players), [2.0 * 1000.0 / players]))
+        case = make_case([trophy(1)], history, horizon_minutes=1440,
+                         target="2026-11-20T18:00:00Z",
+                         at="2026-11-19T18:00:00Z")
+        out = forecast.forecast_case(case)
+        last = history[-1]["rates"][0]
+        self.assertLess(out["trophies"][0]["q"][2], last)
+
+    def test_decomposition_missing_players_falls_back(self):
+        # No player counts at all: the decomposition cannot run, so the
+        # direct logit-rate fit must produce a valid forecast instead.
+        history = [
+            {"slot": "2026-11-19T00:00:00Z", "at": "2026-11-19T00:00:00Z",
+             "players_tracked": None, "trophies_earned": 0, "rates": [1.0]},
+            {"slot": "2026-11-19T01:00:00Z", "at": "2026-11-19T01:00:00Z",
+             "players_tracked": None, "trophies_earned": 0, "rates": [1.2]},
+        ]
+        case = make_case([trophy(1)], history)
+        out = forecast.forecast_case(case)
+        self.assertEqual(len(out["trophies"]), 1)
+        self.assertEqual(out["trophies"][0]["q"],
+                         sorted(out["trophies"][0]["q"]))
+
 
 class TestEndToEnd(unittest.TestCase):
     def test_cli_writes_outputs_and_is_deterministic(self):
